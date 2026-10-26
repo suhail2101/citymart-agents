@@ -252,6 +252,8 @@ sequenceDiagram
 
 ## Author
 
-**Suhail** · [LinkedIn](https://www.linkedin.com/in/sak2101) · [GitHub](https://github.com/suhail2101)
+**Suhail** · [LinkedIn](https://www.linkedin.com/in/your-handle) · [GitHub](https://github.com/your-handle)
 
+## License
 
+Add a license of your choice (for example, MIT or CC BY 4.0) before publishing.
