@@ -252,7 +252,7 @@ sequenceDiagram
 
 ## Author
 
-**Suhail** · [LinkedIn](https://www.linkedin.com/in/your-handle) · [GitHub](https://github.com/your-handle)
+**Suhail** · [LinkedIn](https://www.linkedin.com/in/sak2101 · [GitHub](https://github.com/suhail2101)
 
 ## License
 
