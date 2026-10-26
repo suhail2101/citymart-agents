@@ -1,0 +1,497 @@
+[
+  {
+    "id": "orchestrator",
+    "name": "Orchestrator",
+    "role": "Master Coordinator / Router",
+    "description": "Receives user intents, triages priority, validates scope, composes agent call plans, synthesizes responses, and persists trace logs.",
+    "endpoints": {
+      "intent_infer": "/orchestrator/intent",
+      "delegate": "/orchestrator/delegate",
+      "trace_log": "/orchestrator/trace"
+    },
+    "inputs": [
+      "trace_id",
+      "session_id",
+      "user_text",
+      "device_type",
+      "agent_alerts",
+      "management_commands"
+    ],
+    "outputs": [
+      "user_reply",
+      "agent_delegation",
+      "escalation_ticket"
+    ],
+    "policies": {
+      "no_domain_logic": true,
+      "max_response_time_ms": 3000,
+      "retry_policy": "1 retry after 200ms for transient agent timeouts",
+      "reservation_reconciliation_before_pricing": true
+    },
+    "dependencies": [
+      "catalog_agent",
+      "inventory_agent",
+      "pricing_agent",
+      "payment_agent",
+      "order_agent",
+      "delivery_agent",
+      "staff_agent"
+    ],
+    "sla_ms": 200,
+    "notes": "Performs the 5-stage pipeline: intake, validation, delegation, synthesis, reporting. Ensures reservation reconciliation (validate_reservations) immediately prior to monetary operations."
+  },
+  {
+    "id": "customer_profile_agent",
+    "name": "Customer Profile Agent (CPA)",
+    "role": "Identity & Loyalty Authority",
+    "description": "Stores PII (masked), loyalty tier, KYC status and preferred store. Provides read-only views for pricing and serviceability checks; handles purge events for Right-to-Forget.",
+    "endpoints": {
+      "get_profile": "/cpa/get",
+      "update_profile": "/cpa/update"
+    },
+    "inputs": [
+      "customer_id",
+      "auth_token"
+    ],
+    "outputs": [
+      "loyalty_tier",
+      "kyc_status",
+      "preferred_store"
+    ],
+    "security": {
+      "mask_pii_in_responses": true,
+      "tokenization": true
+    },
+    "sla_ms": 200,
+    "notes": "Never return raw PANs. If purge requested, cascade anonymize events to other agents."
+  },
+  {
+    "id": "catalog_agent",
+    "name": "Catalog Agent",
+    "role": "Product Truth",
+    "description": "Holds product metadata, tax codes, allergens, and returnability flags. Serves SKU lookups and classification used by UI and other agents.",
+    "endpoints": {
+      "get_sku": "/catalog/sku",
+      "search": "/catalog/search"
+    },
+    "outputs": [
+      "sku_id",
+      "is_returnable",
+      "tax_code",
+      "attributes"
+    ],
+    "sla_ms": 200,
+    "notes": "Used by Inventory for location mapping and by Returns Agent to enforce non-returnable categories."
+  },
+  {
+    "id": "inventory_agent",
+    "name": "Inventory Agent",
+    "role": "Warehouse Authority",
+    "description": "Single source of truth for on_hand, reserved, damaged counts. Handles reserve, release, commit flows atomically. Emits low-stock alerts to Procurement.",
+    "endpoints": {
+      "check_availability": "/inv/check",
+      "reserve": "/inv/reserve",
+      "release": "/inv/release",
+      "commit": "/inv/commit"
+    },
+    "inputs": [
+      "sku_id",
+      "store_id",
+      "qty",
+      "session_id",
+      "idempotency_key"
+    ],
+    "outputs": [
+      "status",
+      "available_qty",
+      "reservation_id",
+      "expires_at"
+    ],
+    "transactions": {
+      "reserve_atomic": true,
+      "commit_atomic": true
+    },
+    "behaviors": {
+      "available_to_promise": "on_hand_total - reserved_qty - damaged_qty",
+      "reservation_ttl_seconds": 900,
+      "emit_procurement_alert_when_on_hand_leq_rop": true,
+      "store_idempotency_keys_for_days": 30
+    },
+    "error_codes": [
+      "NOT_FOUND",
+      "OUT_OF_STOCK",
+      "CONFLICT",
+      "RESERVATION_EXPIRED",
+      "SYSTEM_ERROR"
+    ],
+    "sla_ms": {
+      "read": 200,
+      "write": 500
+    },
+    "notes": "Supports push notifications to Cart Agent or Orchestrator on reservation expiration; provide validate_reservations(session_id) endpoint per reconciliation requirement."
+  },
+  {
+    "id": "pricing_agent",
+    "name": "Pricing Agent",
+    "role": "Valuation Authority",
+    "description": "Authoritative price calculator. Applies base prices, taxes, loyalty discounts, and promotion stacking rules using deterministic promotion graph.",
+    "endpoints": {
+      "compute_cart": "/pricing/compute",
+      "validate_coupon": "/pricing/coupon",
+      "override_price": "/pricing/override"
+    },
+    "inputs": [
+      "cart_items",
+      "customer_id",
+      "geo_location",
+      "applied_coupons",
+      "delivery_fee"
+    ],
+    "outputs": [
+      "cart_total",
+      "breakdown",
+      "price_version_id",
+      "requires_approval"
+    ],
+    "promo_logic": {
+      "non_stackable": "choose_best_total",
+      "stackable": "apply_in_priority_order",
+      "conflict_graph_check": true
+    },
+    "sla_ms": 200,
+    "notes": "Pricing Agent must be called after reservation validation and *after* Delivery Agent returns delivery_fee (so Payment amount matches). Payment Agent SHOULD validate amount against Pricing Agent snapshot (not Order Agent)."
+  },
+  {
+    "id": "cart_agent",
+    "name": "Cart Agent",
+    "role": "Session Basket",
+    "description": "Ephemeral cart stored in Redis. Links items to Inventory reservation_ids. Provides snapshot for UI but defers real pricing to Pricing Agent.",
+    "endpoints": {
+      "add_item": "/cart/add",
+      "get_cart": "/cart/get",
+      "remove_item": "/cart/remove",
+      "validate_reservations": "/cart/validate_reservations"
+    },
+    "inputs": [
+      "session_id",
+      "sku_id",
+      "qty",
+      "idempotency_key"
+    ],
+    "outputs": [
+      "cart_snapshot",
+      "reservation_ids"
+    ],
+    "behaviors": {
+      "reserve_on_add": true,
+      "reservation_linking": true,
+      "reconciliation_policy": "validate_reservations_before_checkout",
+      "expiry_hours": 24
+    },
+    "sla_ms": 100,
+    "notes": "Cart must call inventory.validate_reservations through Orchestrator before any price computation or payment."
+  },
+  {
+    "id": "payment_agent",
+    "name": "Payment Agent",
+    "role": "Transactor",
+    "description": "Executes captures and refunds via external PSP. Maintains idempotency for all mutating financial calls and enforces fraud/velocity checks.",
+    "endpoints": {
+      "charge": "/payment/charge",
+      "refund": "/payment/refund",
+      "status_by_idempotency": "/payment/status"
+    },
+    "inputs": [
+      "order_id",
+      "amount",
+      "payment_token",
+      "idempotency_key",
+      "customer_id"
+    ],
+    "outputs": [
+      "tx_id",
+      "status",
+      "gateway_ref"
+    ],
+    "security": {
+      "no_pan_storage": true,
+      "vault_token_used": true
+    },
+    "behaviors": {
+      "idempotency_required": true,
+      "store_idempotency_for_days": 30,
+      "three_strike_flag": true,
+      "timeout_seconds": 8
+    },
+    "validation_rules": {
+      "amount_validation_source": "pricing_agent_snapshot",
+      "velocity_check_threshold": 5
+    },
+    "sla_ms": 5000,
+    "notes": "Payment Agent must never read order totals from Order Agent pre-creation; it verifies via Pricing Agent. On timeouts, orchestrator must check idempotency status before re-asking user."
+  },
+  {
+    "id": "order_agent",
+    "name": "Order Agent",
+    "role": "Lifecycle Manager",
+    "description": "Generates immutable order records once payment and reservation are validated. Emits events for fulfillment and delivery. Handles state transitions only forward.",
+    "endpoints": {
+      "create_order": "/order/create",
+      "update_state": "/order/update",
+      "get_order": "/order/get"
+    },
+    "inputs": [
+      "customer_id",
+      "cart_snapshot",
+      "reservation_ids",
+      "payment_tx_id",
+      "idempotency_key"
+    ],
+    "outputs": [
+      "order_id",
+      "picklist_id",
+      "status"
+    ],
+    "behaviors": {
+      "triple_check": [
+        "verify_reservations",
+        "verify_payment_tx"
+      ],
+      "commit_latency_limit_ms": 1000
+    },
+    "error_codes": [
+      "CONFLICT",
+      "VALIDATION_ERROR",
+      "SYSTEM_ERROR"
+    ],
+    "notes": "If reservation expired between payment and order creation, return CONFLICT and instruct Orchestrator to refund via Payment Agent using idempotency_key supplied by Returns/Order flows."
+  },
+  {
+    "id": "delivery_agent",
+    "name": "Delivery Agent",
+    "role": "Logistics Authority",
+    "description": "Computes delivery fees & ETA (Haversine or RoadNet depending on config), schedules drivers or 3P providers, and exposes serviceability checks.",
+    "endpoints": {
+      "estimate": "/delivery/estimate",
+      "schedule": "/delivery/schedule",
+      "status": "/delivery/status"
+    },
+    "inputs": [
+      "store_id",
+      "target_address",
+      "cart_total_value",
+      "order_id"
+    ],
+    "outputs": [
+      "serviceable",
+      "distance_km",
+      "fee",
+      "eta_minutes",
+      "tracking_url"
+    ],
+    "behaviors": {
+      "max_radius_km": 15,
+      "free_delivery_threshold": 50,
+      "distance_calculation": "configurable(haversine|road_network)"
+    },
+    "sla_ms": 500,
+    "notes": "Must return fee before Payment Agent is called so Pricing Agent can include delivery_fee in final amount."
+  },
+  {
+    "id": "returns_agent",
+    "name": "Returns Agent",
+    "role": "Reverse Logistics",
+    "description": "Validates return eligibility, issues RMA, orchestrates refunds, and instructs inventory adjustments. Generates idempotency_keys for refunds.",
+    "endpoints": {
+      "initiate_return": "/returns/initiate",
+      "process_refund": "/returns/refund",
+      "receive_item": "/returns/receive"
+    },
+    "inputs": [
+      "order_id",
+      "sku_id",
+      "qty",
+      "reason",
+      "manager_override_token(optional)"
+    ],
+    "outputs": [
+      "rma_id",
+      "status",
+      "estimated_refund"
+    ],
+    "behaviors": {
+      "window_days": 30,
+      "non_returnable_flag_check": true,
+      "generate_refund_idempotency_key": true
+    },
+    "sla_ms": 1000,
+    "notes": "Refunds use Payment Agent with idempotency_key created by Returns Agent. Manager overrides produce signed audit entries."
+  },
+  {
+    "id": "staff_hr_agent",
+    "name": "Staff & HR Agent",
+    "role": "Workforce Authority",
+    "description": "Manages employee records, role-based access, shift state, and assigns escalation tickets. Issues signed override tokens limited by scope and TTL.",
+    "endpoints": {
+      "authorize": "/staff/authorize",
+      "assign_ticket": "/staff/assign",
+      "time_clock": "/staff/time"
+    },
+    "inputs": [
+      "staff_id",
+      "auth_token",
+      "action"
+    ],
+    "outputs": [
+      "override_signature",
+      "assignment_id"
+    ],
+    "behaviors": {
+      "override_token_ttl_seconds": 600,
+      "require_on_shift": true,
+      "audit_on_override": true
+    },
+    "notes": "Override tokens include scope, approver_id, timestamp, and signature. All overrides are logged to Audit Agent."
+  },
+  {
+    "id": "procurement_agent",
+    "name": "Procurement Agent",
+    "role": "Buyer",
+    "description": "Generates POs on Inventory alerts, enforces EOQ/MOQ and budget approvals. Emits expected inbound updates to Inventory Agent.",
+    "endpoints": {
+      "create_po": "/proc/po",
+      "ack_supplier": "/proc/ack"
+    },
+    "inputs": [
+      "sku_id",
+      "current_on_hand",
+      "rop_trigger_level",
+      "recommended_qty"
+    ],
+    "outputs": [
+      "po_id",
+      "eta",
+      "status"
+    ],
+    "behaviors": {
+      "auto_approve_threshold": 1000,
+      "respect_moq": true
+    },
+    "notes": "If budget exceeded, mark PO PENDING_APPROVAL and escalate to Procurement Manager via Staff Agent."
+  },
+  {
+    "id": "forecasting_agent",
+    "name": "Forecasting Agent",
+    "role": "Demand Predictor",
+    "description": "Produces demand models (avg, sigma, trend) and seasonal flags. Pushes safety stock updates to Inventory Agent on schedule.",
+    "endpoints": {
+      "run_batch": "/forecast/run",
+      "get_model": "/forecast/get"
+    },
+    "behaviors": {
+      "daily_batch_time_utc": "02:00",
+      "lookback_days": 90
+    },
+    "notes": "Applies promotion multipliers when promotions upcoming; provides inputs for ROP formula."
+  },
+  {
+    "id": "audit_agent",
+    "name": "Audit Agent",
+    "role": "Black Box Recorder",
+    "description": "Append-only, cryptographically chained logs of all agent interactions. Provides WORM storage for compliance and dispute resolution.",
+    "endpoints": {
+      "ingest": "/audit/ingest",
+      "query": "/audit/query"
+    },
+    "behaviors": {
+      "chain_hash_algorithm": "sha256",
+      "ack_within_ms": 200,
+      "append_only": true
+    },
+    "notes": "All agents must include trace_id and hash payload before acknowledging success. Audit entries include previous_hash to create tamper-evident chain."
+  },
+  {
+    "id": "navigation_agent",
+    "name": "Navigation Agent",
+    "role": "In-Store Wayfinding",
+    "description": "Maps SKUs to planogram locations (aisle, bay, shelf) and computes walking routes for customers and pick routes for staff. Inventory-blind: returns where a product belongs, not whether it is in stock.",
+    "endpoints": {
+      "locate_sku": "/nav/locate",
+      "find_route": "/nav/route",
+      "optimize_picklist": "/nav/picklist"
+    },
+    "inputs": [
+      "intent",
+      "target_skus",
+      "store_id",
+      "current_location",
+      "user_role",
+      "accessibility_flag"
+    ],
+    "outputs": [
+      "status",
+      "total_distance_meters",
+      "estimated_time_seconds",
+      "optimized_path",
+      "map_overlay_url"
+    ],
+    "behaviors": {
+      "inventory_blind": true,
+      "customer_routes_exclude_staff_only_zones": true,
+      "staff_routes_may_use_backroom_shortcuts": true,
+      "accessibility_route_excludes_stairs_and_narrow_aisles": true,
+      "picklist_ordering": "heavy items first, chilled and frozen items last",
+      "route_solver": "graph pathfinding with traveling-salesman heuristic for multi-item picklists"
+    },
+    "error_codes": [
+      "NOT_FOUND",
+      "INVALID_LOCATION",
+      "UNROUTABLE",
+      "SYSTEM_ERROR"
+    ],
+    "sla_ms": {
+      "read": 200
+    },
+    "notes": "Read-only access to Catalog for product dimensions and handling requirements. Never calls Inventory; the Orchestrator combines location with stock status."
+  },
+  {
+    "id": "analytics_agent",
+    "name": "Analytics Agent",
+    "role": "Reporting and Business Intelligence",
+    "description": "Consumes the event stream from all agents and produces KPI roll-ups, conversion funnels, end-of-day reports and anomaly alerts. Read-only and non-transactional.",
+    "endpoints": {
+      "get_report": "/analytics/report",
+      "get_kpis": "/analytics/kpis",
+      "get_anomalies": "/analytics/anomalies"
+    },
+    "inputs": [
+      "report_type",
+      "store_id",
+      "date_range",
+      "granularity"
+    ],
+    "outputs": [
+      "status",
+      "metrics",
+      "series",
+      "anomalies",
+      "generated_at"
+    ],
+    "behaviors": {
+      "read_only": true,
+      "ingests_from": "event stream (all agents) via Orchestrator-managed bus",
+      "pii_free_inputs": true,
+      "end_of_day_report_time_utc": "23:59",
+      "anomaly_example": "payment failure rate above 10% in the last hour"
+    },
+    "error_codes": [
+      "INVALID_RANGE",
+      "NO_DATA",
+      "SYSTEM_ERROR"
+    ],
+    "sla_ms": {
+      "read": 2000
+    },
+    "notes": "Never writes to any transactional store and cannot change prices, stock or orders. Alerts are delivered to the Orchestrator, which decides whether to notify staff."
+  }
+]

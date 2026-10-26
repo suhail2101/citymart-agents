@@ -1,0 +1,37 @@
+sequenceDiagram
+  autonumber
+  participant U as User
+  participant O as Orchestrator
+  participant CART as Cart
+  participant INV as Inventory
+  participant DEL as Delivery
+  participant PRI as Pricing
+  participant PAY as Payment
+  participant ORD as Order
+
+  U->>O: add to cart (sku, qty)
+  O->>INV: reserve(sku, qty, ttl=15m, idempotency_key)
+  INV-->>O: reservation_id
+  O->>CART: add_item(sku, qty, reservation_id)
+
+  U->>O: checkout
+  O->>INV: validate_reservations(session)
+  INV-->>O: all active
+  O->>DEL: estimate(store, address, cart)
+  DEL-->>O: fee, eta
+  O->>PRI: compute_cart(items, delivery_fee, tier)
+  PRI-->>O: total, breakdown, signed price_version_id
+  O->>PAY: charge(total, payment_token, price_version_id, idempotency_key)
+  PAY-->>O: approved, transaction_id
+  O->>ORD: create_order(snapshot, reservation_ids, transaction_id)
+  ORD-->>O: order_id
+  O->>INV: commit(reservation_ids)
+
+  alt reservation expired between payment and order
+    INV-->>O: CONFLICT
+    O->>PAY: refund(transaction_id, idempotency_key)
+  else committed
+    INV-->>O: COMMITTED
+  end
+
+  Note over O,PAY: Every call emits a trace_id event to Audit
